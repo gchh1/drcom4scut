@@ -315,7 +315,6 @@ impl<'a> Process<'a> {
                                     loop {
                                         if let Ok(mut r) = data.try_write() {
                                             r.cks_md5 = x.data;
-                                            info!("cks_md5(md5): {}", hex::encode(&r.cks_md5));
                                             break;
                                         }
                                         util::sleep();
@@ -505,7 +504,11 @@ impl<'a> Process<'a> {
                 thread::sleep(duration);
                 let mut cnt = timeout.load(Ordering::Relaxed);
                 if cnt > count {
-                    error!("Heartbeat timeout. No Misc Heartbeat packet received for {}s, but ignored.", udp_timeout * cnt as i32);
+                    error!("Heartbeat timeout. No Misc Heartbeat packet received for {}s.", udp_timeout * cnt as i32);
+                    if crate::settings::MATCHES.get_flag("service-worker") {
+                        error!("Service will restart authentication to recover the UDP heartbeat.");
+                        std::process::exit(1);
+                    }
                     cnt = 0;
                 }
                 timeout.store(cnt + 1, Ordering::Release);

@@ -1,56 +1,81 @@
-name: Rust
-on: [push, pull_request]
-env:
-  CARGO_TERM_COLOR: always
-  NPCAP_SDK_URL: "https://npcap.com/dist/npcap-sdk-1.15.zip"
-  bin_dir: ./tmp_bin
-jobs:
-  build:
-    strategy:
-      matrix:
-        os: [ubuntu-latest]
-        target:
-          - x86_64-unknown-linux-gnu
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-        include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
+name: Build
 
-    runs-on: ${{ matrix.os }}
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
-      - name: Cache Windows dependencies
-        if: matrix.os == 'windows-latest'
-        id: cache-windows
-        uses: actions/cache@v4
-        with:
-          key: ${{ env.NPCAP_SDK_URL }}
-          path: .\Packet.lib
-      - name: Install Windows dependencies
-        if: matrix.os == 'windows-latest' && steps.cache-windows.outputs.cache-hit != 'true'
+          components: rustfmt, clippy
+      - name: Download Npcap SDK for linking
         shell: pwsh
         run: |
-          $sdkPath = ".\tmp"
-          mkdir $sdkPath
-          Invoke-WebRequest -Uri $env:NPCAP_SDK_URL -OutFile "$sdkPath\npcap-sdk.zip"
-          Expand-Archive -Path "$sdkPath\npcap-sdk.zip" -DestinationPath $sdkPath
-          Copy-Item -Path "$sdkPath\Lib\x64\Packet.lib" -Destination .
-      - name: Build
-        run: cargo build --verbose
-      - name: Build for release
-        run: cargo build --release --verbose
-      - name: Test
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo test --verbose
-      - name: Cargo Install
-        run: cargo install --locked --path . --target-dir target --root ${{ env.bin_dir }}
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          Invoke-WebRequest 'https://npcap.com/dist/npcap-sdk-1.15.zip' -OutFile "$env:RUNNER_TEMP\npcap-sdk.zip"
+          Expand-Archive "$env:RUNNER_TEMP\npcap-sdk.zip" "$env:RUNNER_TEMP\npcap-sdk"
+          Copy-Item "$env:RUNNER_TEMP\npcap-sdk\Lib\x64\Packet.lib" Packet.lib
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Test management CLI
+        run: cargo test --locked --bin drcom4scut
+      - name: Check code
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Build and package Windows x64
+        shell: pwsh
+        run: ./scripts/package-windows.ps1
+      - uses: actions/upload-artifact@v4
         with:
-          name: drcom4scut-${{ matrix.target }}
-          path: ${{ env.bin_dir }}/bin
+          name: drcom4scut-windows-x64
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drcom4scut-linux-x64
+          path: |
+            target/release/drcom4scut
+            target/release/drcom4scut-worker
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: drcom4scut-windows-x64
+          path: dist
+      - name: Publish tagged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          TAG="v$VERSION"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists"
+            exit 0
+          fi
+          gh release create "$TAG" dist/*.zip dist/*.sha256 --target "$GITHUB_SHA" --generate-notes --title "$TAG" -R "$GITHUB_REPOSITORY"

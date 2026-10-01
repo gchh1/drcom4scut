@@ -4,6 +4,7 @@
 #Added by cargo
 
 /target
+/dist
 /logs
 config.yml
 

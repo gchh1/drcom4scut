@@ -16,6 +16,8 @@ fn get_matches() -> ArgMatches {
         .author(crate_authors!())
         .about(crate_description!())
         .args(&[
+            arg!(--"check-adapter" "List adapters and optionally open --mac without sending packets.").action(ArgAction::SetTrue),
+            arg!(--"service-worker" "Use unattended worker settings.").action(ArgAction::SetTrue).hide(true),
             arg!(-c --config <config> "Path to config file.").default_value("config.yml"),
             arg!(-D --debug "Enable debug mode.").action(ArgAction::SetTrue),
             arg!(-m --mac <mac> "Ethernet Device MAC address.").required(false),
@@ -29,7 +31,7 @@ fn get_matches() -> ArgMatches {
         .get_matches()
 }
 
-static MATCHES: LazyLock<ArgMatches> = LazyLock::new(get_matches);
+pub static MATCHES: LazyLock<ArgMatches> = LazyLock::new(get_matches);
 pub static DEBUG: LazyLock<bool> = LazyLock::new(|| MATCHES.get_flag("debug"));
 pub static SETTINGS: LazyLock<Settings> = LazyLock::new(|| Settings::parse(&MATCHES));
 
@@ -232,7 +234,9 @@ impl Settings {
         Config::builder()
             .add_source(config::File::new(config_path, FileFormat::Yaml).required(false))
             .build()
-            .expect("Can't read config file.")
+            .unwrap_or_else(|_| {
+                panic!("Can't read configuration. Check file access and YAML syntax.")
+            })
     }
     fn resolve(mut settings: Settings, matches: &ArgMatches, cfg: Config) -> Settings {
         // 解析配置文件
@@ -416,6 +420,16 @@ impl Settings {
         let settings = Settings::default();
         let path = matches.get_one::<String>("config").unwrap().to_owned();
         let cfg = Settings::read_config(&path);
-        Settings::resolve(settings, matches, cfg)
+        #[allow(unused_mut)]
+        let mut settings = Settings::resolve(settings, matches, cfg);
+        #[cfg(feature = "log4rs")]
+        if matches.get_flag("service-worker") {
+            settings.log.enable_console = false;
+            settings.log.enable_file = true;
+            settings.log.file_directory = "logs".into();
+            settings.log.level_filter = log::LevelFilter::Info;
+        }
+        settings.reconnect = settings.reconnect.max(1);
+        settings
     }
 }

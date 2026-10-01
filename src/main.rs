@@ -1,4 +1,3 @@
-#![feature(ip)]
 mod device;
 mod eap;
 mod logger;
@@ -17,18 +16,70 @@ use crate::socket::Socket;
 use crate::util::{ChannelData, State, sleep_at};
 
 fn main() {
+    if settings::MATCHES.get_flag("check-adapter") {
+        let interfaces = device::get_all_interfaces();
+        if interfaces.is_empty() {
+            eprintln!("No adapters found. Check Npcap driver installation and permissions.");
+            std::process::exit(1);
+        }
+        for interface in interfaces {
+            println!(
+                "{} | {} | MAC {} | IP {:?}",
+                interface.name,
+                interface.description,
+                interface
+                    .mac
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "none".into()),
+                interface.ips
+            );
+        }
+        if let Some(mac) = settings::MATCHES.get_one::<String>("mac") {
+            let device = mac
+                .parse::<pnet::datalink::MacAddr>()
+                .map_err(|e| format!("Invalid MAC: {e}"))
+                .and_then(|mac| {
+                    let interface = device::get_all_interfaces()
+                        .into_iter()
+                        .find(|i| i.mac == Some(mac))
+                        .ok_or_else(|| "No adapter matches that MAC".to_string())?;
+                    device::Device::with_ip_net(interface, "0.0.0.0/0".parse().unwrap())
+                        .map_err(|e| e.to_string())
+                });
+            match device {
+                Ok(device) => println!(
+                    "Adapter opened successfully: {}. No authentication packets sent.",
+                    device.mac
+                ),
+                Err(error) => {
+                    eprintln!("Cannot open adapter: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        return;
+    }
     let settings = &settings::SETTINGS;
 
     logger::init(settings);
 
     info!("Start to run...");
-    let device =
-        device::get_device(settings.mac, settings.ip).expect("Fail on getting ethernet device!");
-    info!("Ethernet Device: {}", &device.interface.name);
-    info!("MAC address: {}", &device.mac);
-    info!("IP Address/Prefix: {}", &device.ip_net);
+    let device = loop {
+        match device::get_device(settings.mac, settings.ip) {
+            Ok(device) => break device,
+            Err(error) => {
+                error!(
+                    "Wired adapter unavailable: {error}. Check cable, adapter MAC and Npcap permissions; retry in {} seconds.",
+                    settings.reconnect
+                );
+                thread::sleep(Duration::from_secs(settings.reconnect));
+            }
+        }
+    };
+    info!("Ethernet Device: {}", device.interface.name);
+    info!("MAC address: {}", device.mac);
+    info!("IP Address/Prefix: {}", device.ip_net);
     info!("Username: {}", settings.username);
-    info!("Password: {}", settings.password);
     for dns in &settings.dns {
         info!("DNS Server: {dns}");
     }
@@ -58,6 +109,23 @@ fn main() {
     let mac = device.mac;
     let ip = device.ip_net.ip();
 
+    if settings::MATCHES.get_flag("service-worker") {
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(5));
+                let current = device::get_all_interfaces()
+                    .into_iter()
+                    .find(|i| i.mac == Some(mac));
+                if !current.is_some_and(|i| i.ips.iter().any(|network| network.ip() == ip)) {
+                    error!(
+                        "Selected adapter disappeared or its IPv4 address changed; restarting authentication through the service."
+                    );
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
+
     let (tx, rx) = crossbeam_channel::unbounded::<ChannelData>();
     let tx1 = tx.clone();
 
@@ -71,7 +139,7 @@ fn main() {
                 if broke {
                     info!("Try get the property ethernet device.");
                     loop {
-                        match device::get_device(Some(mac), Some(ip)) {
+                        match device::get_device(Some(mac), settings.ip) {
                             Ok(d) => {
                                 device = Arc::new(d);
                                 break;
@@ -103,6 +171,10 @@ fn main() {
                                     );
                                 }
                                 State::Quit => {
+                                    if settings::MATCHES.get_flag("service-worker") {
+                                        error!("EAP adapter session failed; service will restart the worker.");
+                                        std::process::exit(1);
+                                    }
                                     break;
                                 }
                                 _ => {
@@ -145,17 +217,17 @@ fn main() {
                     thread::Builder::new()
                         .name("UDP-Process".to_owned())
                         .spawn(move || {
-                            let (udp_ip, dns) = match socket::resolve_dns(settings) {
+                            let (udp_ip, dns) = match socket::resolve_dns(settings, ip) {
                                 Some(r) => r,
                                 None => {
                                     error!("UDP: Can't resolve '{}'.", settings.host);
                                     return;
                                 }
                             };
-                            let socket = Socket::new(match socket::socket_bind(udp_ip) {
-                                Some(socket) => socket,
-                                None => {
-                                    error!("UDP: Can't create socket and connect to '{udp_ip}'.");
+                            let socket = Socket::new(match socket::socket_bind(udp_ip, ip) {
+                                Ok(socket) => socket,
+                                Err(error) => {
+                                    error!("UDP: Can't connect from selected adapter {ip} to {udp_ip}: {error}");
                                     return;
                                 }
                             });

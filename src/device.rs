@@ -25,12 +25,12 @@ fn filter_interface<P: FnMut(&NetworkInterface) -> bool>(f: P) -> Option<Network
 fn get_first_valid_ip(e: &NetworkInterface) -> Option<&IpNetwork> {
     e.ips
         .iter()
-        .find(|&ip_net| ip_net.prefix() != 0 && ip_net.ip().is_global())
+        .find(|ip_net| matches!(ip_net.ip(), IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() && !ip.is_link_local()))
 }
 
 pub fn get_all_interfaces() -> Vec<NetworkInterface> {
     let mut all_interfaces = interfaces();
-    all_interfaces.sort_by(|a, b| a.index.cmp(&b.index));
+    all_interfaces.sort_by_key(|a| a.index);
     all_interfaces
 }
 
@@ -95,10 +95,14 @@ impl Device {
     pub fn new(interface: NetworkInterface) -> Result<Device> {
         let ip = if let Some(ip) = get_first_valid_ip(&interface) {
             ip.to_owned()
-        } else if let Some(ip) = interface.ips.first() {
-            ip.to_owned()
         } else {
-            IpNetwork::new(IpAddr::from(Ipv4Addr::new(0, 0, 0, 0)), 0).unwrap()
+            return Err(Error::new(
+                ErrorKind::AddrNotAvailable,
+                format!(
+                    "Adapter {} has no usable IPv4 address yet; check cable and DHCP.",
+                    interface.name
+                ),
+            ));
         };
         Device::with_ip_net(interface, ip)
     }
@@ -132,18 +136,19 @@ impl Device {
 
     pub fn default() -> Result<Device> {
         let all_interfaces = get_all_interfaces();
-        for e in &all_interfaces {
-            if let Some(ip_net) = get_first_valid_ip(e) {
-                return Device::with_ip_net(e.to_owned(), ip_net.to_owned());
-            }
-        }
-        if let Some(e) = all_interfaces.first() {
-            Device::new(e.to_owned())
-        } else {
-            Err(Error::new(
+        let mut candidates = all_interfaces
+            .iter()
+            .filter(|e| e.mac.is_some() && !e.is_loopback() && get_first_valid_ip(e).is_some());
+        match (candidates.next(), candidates.next()) {
+            (Some(interface), None) => Device::new(interface.clone()),
+            (Some(_), Some(_)) => Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Multiple adapters have IPv4 addresses. Set the wired adapter MAC in config.yml; use doctor to list adapters.",
+            )),
+            _ => Err(Error::new(
                 ErrorKind::NotFound,
-                "Can't get the default interface.",
-            ))
+                "No adapter with a usable IPv4 address. Check cable and DHCP.",
+            )),
         }
     }
 
